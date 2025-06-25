@@ -1,0 +1,22 @@
+{
+  "server": "npx -y @modelcontextprotocol/server-google-maps",
+  "tools": [
+    {
+      "name": "maps_search_places",
+      "arguments": {
+        "query": "Golden Gate Bridge"
+      }
+    },
+    {
+      "name": "maps_geocode",
+      "arguments": {
+        "address": "1600 Pennsylvania Avenue NW, Washington, DC"
+      }
+    }
+  ],
+  "options": {
+    "verbose": false,
+    "list_only": false,
+    "interactive": false
+  }
+} 
