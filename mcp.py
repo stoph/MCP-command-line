@@ -7,6 +7,9 @@ import shlex
 import sys
 from urllib.parse import urlparse
 
+# MCP Protocol Configuration
+MCP_PROTOCOL_VERSION = "2025-06-18"
+
 # Try to import requests, install if not available
 try:
     import requests
@@ -443,7 +446,7 @@ def run_mcp_session(client, verbose, tools_to_test, list_only, interactive):
         "id": message_id,
         "method": "initialize",
         "params": {
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {
                 "tools": {}
             },
