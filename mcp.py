@@ -5,6 +5,15 @@ import os
 import argparse
 import shlex
 import sys
+from urllib.parse import urlparse
+
+# Try to import requests, install if not available
+try:
+    import requests
+except ImportError:
+    print("Installing requests library...")
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'requests'])
+    import requests
 
 def display_mcp_result(response, title="Result"):
     """Display MCP tool response in a nicely formatted way"""
@@ -261,15 +270,86 @@ def interactive_tool_selection(available_tools):
     
     return selected_tools
 
+class HttpMcpClient:
+    """Simple HTTP-based MCP client using requests"""
+    
+    def __init__(self, base_url, headers=None, verbose=False):
+        self.base_url = base_url.rstrip('/')
+        self.headers = headers or {}
+        self.verbose = verbose
+        self.session_headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            **self.headers
+        }
+        
+    def send_request(self, message):
+        """Send HTTP request to MCP server"""
+        try:
+            if self.verbose:
+                print(f"→ HTTP POST {self.base_url}")
+                print(f"→ Headers: {json.dumps(self.session_headers, indent=2)}")
+                print(f"→ Body: {json.dumps(message, indent=2)}")
+            
+            # Use the URL exactly as provided - don't append /mcp
+            response = requests.post(
+                self.base_url,
+                json=message,
+                headers=self.session_headers,
+                timeout=30
+            )
+            
+            if self.verbose:
+                print(f"← HTTP {response.status_code}")
+                print(f"← {response.text}")
+            
+            response.raise_for_status()  # Raise exception for bad status codes
+            return response.json()
+                
+        except requests.exceptions.RequestException as e:
+            print(f"✗ HTTP Request Error: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            print(f"✗ Invalid JSON response: {e}")
+            return None
+        except Exception as e:
+            print(f"✗ Unexpected error: {e}")
+            return None
+
+def is_http_server(server_command):
+    """Check if server command is an HTTP URL"""
+    try:
+        parsed = urlparse(server_command)
+        return parsed.scheme in ('http', 'https') and parsed.netloc
+    except:
+        return False
+
 def create_mcp_client(server_command, env_vars=None, verbose=False):
-    """Create MCP client - extensible for future HTTP support"""
+    """Create MCP client - automatically detects STDIO vs HTTP"""
+    if is_http_server(server_command):
+        return create_http_client(server_command, env_vars, verbose)
+    else:
+        return create_stdio_client(server_command, env_vars, verbose)
+
+def create_http_client(base_url, env_vars=None, verbose=False):
+    """Create HTTP-based MCP client"""
+    if verbose:
+        print(f"Creating HTTP MCP client for: {base_url}")
     
-    # Auto-detect transport type (future-proofing)
-    if server_command.startswith(('http://', 'https://')):
-        raise NotImplementedError("HTTP transport not yet supported")
+    # Convert env_vars to HTTP headers if provided
+    headers = {}
+    if env_vars:
+        # Common patterns for API keys in headers
+        for key, value in env_vars.items():
+            if key.upper().endswith('_API_KEY'):
+                headers[f'X-API-Key'] = value
+            elif key.upper() == 'AUTHORIZATION':
+                headers['Authorization'] = value
+            elif key.upper().startswith('X-'):
+                headers[key] = value
     
-    # STDIO transport
-    return create_stdio_client(server_command, env_vars, verbose)
+    client = HttpMcpClient(base_url, headers, verbose)
+    return client, verbose
 
 def create_stdio_client(server_command, env_vars=None, verbose=False):
     """Create STDIO-based MCP client"""
@@ -307,29 +387,57 @@ def create_stdio_client(server_command, env_vars=None, verbose=False):
         print(f"✗ Failed to start server: {e}")
         sys.exit(1)
 
-def send_message(proc, message, verbose=False):
-    """Send a JSON-RPC message to the MCP server"""
-    json_msg = json.dumps(message)
-    if verbose:
-        print(f"📤 Sending: {json_msg}")
-    proc.stdin.write(json_msg + '\n')
-    proc.stdin.flush()
-
-def read_response(proc, verbose=False):
-    """Read and parse a response from the MCP server"""
-    line = proc.stdout.readline()
-    if line.strip():
-        response = json.loads(line.strip())
+def send_message(client, message, verbose=False):
+    """Send message to MCP server (works with both STDIO and HTTP clients)"""
+    if hasattr(client, 'send_request'):
+        # HTTP client - no separate send needed, handled in send_request
+        pass  
+    else:
+        # STDIO client
+        message_json = json.dumps(message) + '\n'
         if verbose:
-            print(f"📥 Received: {response}")
-        return response
-    return None
+            print(f"→ {json.dumps(message, indent=2)}")
+        client.stdin.write(message_json)
+        client.stdin.flush()
 
-def run_mcp_session(proc, verbose, tools_to_test, list_only, interactive):
-    """Run the MCP session with the given parameters"""
+def read_response(client, verbose=False):
+    """Read response from MCP server (works with both STDIO and HTTP clients)"""
+    if hasattr(client, 'send_request'):
+        # HTTP client - response already handled in send_request
+        return None  # HTTP responses are handled synchronously
+    else:
+        # STDIO client
+        try:
+            line = client.stdout.readline()
+            if not line:
+                return None
+            response = json.loads(line.strip())
+            if verbose:
+                print(f"← {json.dumps(response, indent=2)}")
+            return response
+        except json.JSONDecodeError:
+            return None
+        except Exception:
+            return None
+
+def send_and_receive(client, message, verbose=False):
+    """Send message and receive response (unified interface for STDIO and HTTP)"""
+    if hasattr(client, 'send_request'):
+        # HTTP client
+        return client.send_request(message)
+    else:
+        # STDIO client  
+        send_message(client, message, verbose)
+        return read_response(client, verbose)
+
+def run_mcp_session(client, verbose, tools_to_test, list_only, interactive):
+    """Run an MCP session with capability discovery and tool execution"""
     message_id = 1
     
-    # Initialize the MCP server
+    # Initialize the session
+    print("🔗 Initializing MCP session...")
+    
+    # Send initialization message
     init_message = {
         "jsonrpc": "2.0",
         "id": message_id,
@@ -346,43 +454,39 @@ def run_mcp_session(proc, verbose, tools_to_test, list_only, interactive):
         }
     }
 
-    send_message(proc, init_message, verbose)
-    init_response = read_response(proc, verbose)
+    init_response = send_and_receive(client, init_message, verbose)
+    message_id += 1
 
     if not init_response or "result" not in init_response:
-        print("✗ Failed to initialize MCP server")
-        error_output = proc.stderr.read()
-        if error_output:
-            print("Error output:", error_output)
+        print("✗ Failed to initialize MCP session")
         return False
 
-    print("✓ MCP server initialized successfully")
-    message_id += 1
-    
+    print("✓ MCP session initialized")
+
     # Send initialized notification
     initialized_message = {
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     }
-    send_message(proc, initialized_message, verbose)
-    
-    # List capabilities
-    print("\n🔍 Discovering server capabilities...")
-    
-    # List tools
-    list_tools_message = {
-        "jsonrpc": "2.0",
-        "id": message_id,
-        "method": "tools/list"
-    }
-    send_message(proc, list_tools_message, verbose)
-    tools_response = read_response(proc, verbose)
-    message_id += 1
+    send_message(client, initialized_message, verbose)  # Notifications don't expect responses
 
+    # Only discover capabilities in list-only mode
     available_tools = []
-    if tools_response and "result" in tools_response:
-        available_tools = tools_response["result"]["tools"]
-        if not interactive:
+    if list_only:
+        # List capabilities
+        print("\n🔍 Discovering server capabilities...")
+
+        # List tools
+        list_tools_message = {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "method": "tools/list"
+        }
+        tools_response = send_and_receive(client, list_tools_message, verbose)
+        message_id += 1
+
+        if tools_response and "result" in tools_response:
+            available_tools = tools_response["result"]["tools"]
             if available_tools:
                 print("✓ Available tools:")
                 for tool in available_tools:
@@ -391,50 +495,64 @@ def run_mcp_session(proc, verbose, tools_to_test, list_only, interactive):
                     print(f"  • {tool_name}: {description}")
             else:
                 print("✓ No tools available")
-    else:
-        print("✗ Failed to list tools")
-
-    # List resources
-    list_resources_message = {
-        "jsonrpc": "2.0",
-        "id": message_id,
-        "method": "resources/list"
-    }
-    send_message(proc, list_resources_message, verbose)
-    resources_response = read_response(proc, verbose)
-    message_id += 1
-
-    if resources_response and "result" in resources_response:
-        resources = resources_response["result"]["resources"]
-        if resources:
-            print("✓ Available resources:", [resource["name"] for resource in resources])
         else:
-            print("✓ No resources available")
-    else:
-        print("✗ Failed to list resources")
+            print("✗ Failed to list tools")
 
-    # List prompts
-    list_prompts_message = {
-        "jsonrpc": "2.0",
-        "id": message_id,
-        "method": "prompts/list"
-    }
-    send_message(proc, list_prompts_message, verbose)
-    prompts_response = read_response(proc, verbose)
-    message_id += 1
+        # List resources
+        list_resources_message = {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "method": "resources/list"
+        }
+        resources_response = send_and_receive(client, list_resources_message, verbose)
+        message_id += 1
 
-    if prompts_response and "result" in prompts_response:
-        prompts = prompts_response["result"]["prompts"]
-        if prompts:
-            print("✓ Available prompts:", [prompt["name"] for prompt in prompts])
+        if resources_response and "result" in resources_response:
+            resources = resources_response["result"]["resources"]
+            if resources:
+                print("✓ Available resources:", [resource["name"] for resource in resources])
+            else:
+                print("✓ No resources available")
         else:
-            print("✓ No prompts available")
-    else:
-        print("✗ Failed to list prompts")
+            print("✗ Failed to list resources")
 
-    # Interactive tool selection
-    if interactive and available_tools and not list_only:
-        tools_to_test = interactive_tool_selection(available_tools)
+        # List prompts
+        list_prompts_message = {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "method": "prompts/list"
+        }
+        prompts_response = send_and_receive(client, list_prompts_message, verbose)
+        message_id += 1
+
+        if prompts_response and "result" in prompts_response:
+            prompts = prompts_response["result"]["prompts"]
+            if prompts:
+                print("✓ Available prompts:", [prompt["name"] for prompt in prompts])
+            else:
+                print("✓ No prompts available")
+        else:
+            print("✗ Failed to list prompts")
+
+    # Interactive tool selection (only if not list_only and interactive)
+    elif interactive:
+        # Need to get tools for interactive mode
+        list_tools_message = {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "method": "tools/list"
+        }
+        tools_response = send_and_receive(client, list_tools_message, verbose)
+        message_id += 1
+
+        if tools_response and "result" in tools_response:
+            available_tools = tools_response["result"]["tools"]
+            if available_tools:
+                tools_to_test = interactive_tool_selection(available_tools)
+            else:
+                print("✓ No tools available for interactive selection")
+        else:
+            print("✗ Failed to list tools for interactive mode")
 
     # Execute tools if requested and not list_only
     if not list_only and tools_to_test:
@@ -451,8 +569,7 @@ def run_mcp_session(proc, verbose, tools_to_test, list_only, interactive):
                 "params": tool_spec
             }
             
-            send_message(proc, tool_message, verbose)
-            tool_response = read_response(proc, verbose)
+            tool_response = send_and_receive(client, tool_message, verbose)
             message_id += 1
             
             display_mcp_result(tool_response, f"Tool: {tool_name}")
@@ -532,10 +649,10 @@ def main():
         if config['env_vars']:
             print(f"Environment variables: {config['env_vars']}")
     
-    proc = None
+    client = None
     # Create MCP client
     try:
-        proc, verbose = create_mcp_client(
+        client, verbose = create_mcp_client(
             config['server'], 
             config['env_vars'], 
             config['options']['verbose']
@@ -544,11 +661,14 @@ def main():
         print(f"🚀 Universal MCP Client")
         print(f"📡 Server: {config['server']}")
         if config['env_vars']:
-            print(f"🔐 Environment variables: {list(config['env_vars'].keys())}")
+            if is_http_server(config['server']):
+                print(f"🔐 HTTP Headers: {list(getattr(client, 'headers', {}).keys())}")
+            else:
+                print(f"🔐 Environment variables: {list(config['env_vars'].keys())}")
         
         # Run the session
         success = run_mcp_session(
-            proc, 
+            client, 
             config['options']['verbose'], 
             config['tools'], 
             config['options']['list_only'], 
@@ -566,13 +686,16 @@ def main():
         print(f"❌ Unexpected error: {e}")
     finally:
         # Clean up
-        if proc:
+        if client:
             try:
-                proc.terminate()
-                proc.wait(timeout=5)
+                # Only terminate STDIO processes (HTTP clients don't need cleanup)
+                if hasattr(client, 'terminate'):
+                    client.terminate()
+                    client.wait(timeout=5)
             except:
                 try:
-                    proc.kill()
+                    if hasattr(client, 'kill'):
+                        client.kill()
                 except:
                     pass
 

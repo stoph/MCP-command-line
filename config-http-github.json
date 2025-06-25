@@ -1,0 +1,25 @@
+{
+  "server": "https://api.githubcopilot.com/mcp/",
+  "env": {
+    "AUTHORIZATION": "Bearer your-github-personal-access-token",
+    "DEBUG": "true"
+  },
+  "tools": [
+    {
+      "name": "get_me"
+    },
+    {
+      "name": "get_issue",
+      "arguments": {
+        "owner": "octocat",
+        "repo": "Hello-World",
+        "issue_number": 42
+      }
+    }
+  ],
+  "options": {
+    "verbose": false,
+    "list_only": false,
+    "interactive": false
+  }
+} 
